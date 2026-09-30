@@ -22,6 +22,7 @@ pub struct MyTray {
     pub connected: bool,
     pub listening_mode: Option<u8>,
     pub allow_off_option: Option<u8>,
+    pub heart_rate: Option<u8>,
     pub command_tx: Option<UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>>,
     pub ui_tx: Option<UnboundedSender<BluetoothUIMessage>>,
 }
@@ -103,7 +104,10 @@ impl ksni::Tray for MyTray {
             icon_name: "".to_string(),
             icon_pixmap: vec![],
             title: "Battery Status".to_string(),
-            description: format!("{} {} {}", l, r, c),
+            description: match self.heart_rate {
+                Some(bpm) => format!("{} {} {}\n♥ {} bpm", l, r, c, bpm),
+                None => format!("{} {} {}", l, r, c),
+            },
         }
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {

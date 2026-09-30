@@ -142,6 +142,7 @@ async fn async_main(
             connected: false,
             listening_mode: None,
             allow_off_option: None,
+            heart_rate: None,
             command_tx: None,
             ui_tx: Some(ui_tx.clone()),
         };

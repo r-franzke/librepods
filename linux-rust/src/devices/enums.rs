@@ -1,4 +1,5 @@
 use crate::bluetooth::aacp::BatteryInfo;
+use crate::bluetooth::heart_rate::HeartRateStats;
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::nothing::NothingInformation;
 use iced::widget::combo_box;
@@ -58,6 +59,7 @@ pub struct AirPodsState {
     pub personalized_volume_enabled: bool,
     pub allow_off_mode: bool,
     pub battery: Vec<BatteryInfo>,
+    pub heart_rate: HeartRateStats,
 }
 
 #[derive(Clone, Debug)]

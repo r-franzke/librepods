@@ -1,3 +1,4 @@
+use crate::bluetooth::heart_rate::{self, HeartRateStats};
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::utils::get_devices_path;
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
@@ -306,6 +308,7 @@ pub enum AACPEvent {
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
     StemPress(StemPressType, StemPressBudType),
+    HeartRate(HeartRateStats),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +333,7 @@ pub struct AACPManagerState {
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub devices: HashMap<String, DeviceData>,
     pub airpods_mac: Option<Address>,
+    pub heart_rate: HeartRateStats,
 }
 
 impl AACPManagerState {
@@ -353,6 +357,7 @@ impl AACPManagerState {
             event_tx: None,
             devices,
             airpods_mac: None,
+            heart_rate: HeartRateStats::default(),
         }
     }
 }
@@ -361,6 +366,7 @@ impl AACPManagerState {
 pub struct AACPManager {
     pub state: Arc<Mutex<AACPManagerState>>,
     tasks: Arc<Mutex<JoinSet<()>>>,
+    sensor_sequence: Arc<AtomicU32>,
 }
 
 impl AACPManager {
@@ -368,6 +374,7 @@ impl AACPManager {
         AACPManager {
             state: Arc::new(Mutex::new(AACPManagerState::new())),
             tasks: Arc::new(Mutex::new(JoinSet::new())),
+            sensor_sequence: Arc::new(AtomicU32::new(heart_rate::INITIAL_SEQUENCE)),
         }
     }
 
@@ -917,6 +924,18 @@ impl AACPManager {
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
             }
+            heart_rate::SENSOR_DATA_OPCODE => {
+                if let Some(bpm) = heart_rate::parse_heart_rate_packet(packet) {
+                    let mut state = self.state.lock().await;
+                    state.heart_rate.add_sample(bpm);
+                    if let Some(ref tx) = state.event_tx {
+                        let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+                    }
+                    info!("Received Heart Rate: {} bpm", bpm);
+                } else {
+                    debug!("Received sensor data packet: {}", hex::encode(payload));
+                }
+            }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
     }
@@ -1196,6 +1215,48 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
+    async fn send_heart_rate_service_setting(&self, interval: Duration) -> Result<()> {
+        let sequence = self.sensor_sequence.fetch_add(1, Ordering::Relaxed);
+        let packet = heart_rate::build_service_setting_packet(sequence, interval);
+        self.send_data_packet(&packet).await
+    }
+
+    /// Enables the heart rate monitor and starts streaming samples (one per second).
+    pub async fn start_heart_rate_monitoring(&self) -> Result<()> {
+        info!("Starting heart rate monitoring");
+        self.send_control_command(ControlCommandIdentifiers::HrmState, &[0x01])
+            .await?;
+        sleep(Duration::from_millis(120)).await;
+        self.send_heart_rate_service_setting(heart_rate::DEFAULT_INTERVAL)
+            .await?;
+        let mut state = self.state.lock().await;
+        state.heart_rate.monitoring = true;
+        if let Some(ref tx) = state.event_tx {
+            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+        }
+        Ok(())
+    }
+
+    /// Stops the heart rate stream. Collected statistics are kept.
+    pub async fn stop_heart_rate_monitoring(&self) -> Result<()> {
+        info!("Stopping heart rate monitoring");
+        let result = self.send_heart_rate_service_setting(Duration::ZERO).await;
+        let mut state = self.state.lock().await;
+        state.heart_rate.monitoring = false;
+        if let Some(ref tx) = state.event_tx {
+            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+        }
+        result
+    }
+
+    pub async fn reset_heart_rate_stats(&self) {
+        let mut state = self.state.lock().await;
+        state.heart_rate.reset();
+        if let Some(ref tx) = state.event_tx {
+            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+        }
+    }
+
     pub async fn send_some_packet(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
@@ -1224,6 +1285,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 state.owns = false;
                 state.connected_devices.clear();
                 state.control_command_status_list.clear();
+                state.heart_rate.monitoring = false;
                 break;
             }
         }

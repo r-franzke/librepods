@@ -1,13 +1,15 @@
 use crate::bluetooth::aacp::{AACPManager, ControlCommandIdentifiers};
+use crate::bluetooth::heart_rate::{HISTORY_LEN, HeartRateStats};
 use iced::Alignment::End;
 use iced::border::Radius;
 use iced::overlay::menu;
 use iced::widget::button::Style;
 use iced::widget::rule::FillMode;
 use iced::widget::{
-    Space, button, column, combo_box, container, row, rule, text, text_input, toggler,
+    Row, Space, button, column, combo_box, container, row, rule, scrollable, text, text_input,
+    toggler,
 };
-use iced::{Background, Border, Center, Color, Length, Padding, Theme};
+use iced::{Background, Border, Bottom, Center, Color, Length, Padding, Theme};
 use log::error;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -362,6 +364,8 @@ pub fn airpods_view<'a>(
             )
     };
 
+    let heart_rate_col = heart_rate_section(&mac, state, aacp_manager.clone());
+
     let mut information_col = column![];
     if let Some(device) = devices_list.get(mac_information.as_str()) {
         if let Some(DeviceInformation::AirPods(ref airpods_info)) = device.information {
@@ -507,20 +511,248 @@ pub fn airpods_view<'a>(
         }
     }
 
-    container(column![
+    container(scrollable(column![
         rename_input,
         Space::new().height(Length::from(20)),
         listening_mode,
         Space::new().height(Length::from(20)),
         audio_settings_col,
         Space::new().height(Length::from(20)),
+        heart_rate_col,
+        Space::new().height(Length::from(20)),
         off_listening_mode_toggle,
         Space::new().height(Length::from(20)),
         information_col
-    ])
+    ].padding(Padding {
+        top: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+        right: 12.0,
+    })))
     .padding(20)
     .center_x(Length::Fill)
     .height(Length::Fill)
+}
+
+fn heart_rate_section<'a>(
+    mac: &str,
+    state: &'a AirPodsState,
+    aacp_manager: Arc<AACPManager>,
+) -> iced::widget::Column<'a, Message> {
+    let stats = &state.heart_rate;
+    let secondary_text = |theme: &Theme| {
+        let mut style = text::Style::default();
+        style.color = Some(theme.palette().text.scale_alpha(0.7));
+        style
+    };
+    let separator = || {
+        rule::horizontal(1).style(|theme: &Theme| rule::Style {
+            color: theme.palette().text.scale_alpha(0.2),
+            radius: Radius::from(12),
+            fill_mode: FillMode::Full,
+            snap: false,
+        })
+    };
+    let stat_row = |label: &'static str, value: String| {
+        row![
+            text(label).size(16),
+            Space::new().width(Length::Fill),
+            text(value).size(16)
+        ]
+    };
+    let bpm_text = |bpm: Option<f64>| {
+        bpm.map(|b| format!("{:.0} bpm", b))
+            .unwrap_or_else(|| "-".to_string())
+    };
+
+    let toggle = {
+        let aacp_manager = aacp_manager.clone();
+        let mac = mac.to_string();
+        let state = state.clone();
+        row![
+            column![
+                text("Heart Rate Monitoring").size(16),
+                text("Streams heart rate readings from supported AirPods (e.g. AirPods Pro 3). Wear both AirPods for accurate readings.")
+                    .size(12)
+                    .style(secondary_text)
+                    .width(Length::Fill),
+            ]
+            .width(Length::Fill),
+            toggler(stats.monitoring)
+                .on_toggle(move |is_enabled| {
+                    let aacp_manager = aacp_manager.clone();
+                    run_async_in_thread(async move {
+                        let result = if is_enabled {
+                            aacp_manager.start_heart_rate_monitoring().await
+                        } else {
+                            aacp_manager.stop_heart_rate_monitoring().await
+                        };
+                        if let Err(e) = result {
+                            error!("Failed to toggle heart rate monitoring: {}", e);
+                        }
+                    });
+                    let mut state = state.clone();
+                    state.heart_rate.monitoring = is_enabled;
+                    Message::StateChanged(mac.clone(), DeviceState::AirPods(state))
+                })
+                .spacing(0)
+                .size(20)
+        ]
+        .align_y(Center)
+        .spacing(8)
+    };
+
+    let current = row![
+        text(
+            stats
+                .current()
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "--".to_string())
+        )
+        .size(40)
+        .style(|theme: &Theme| {
+            let mut style = text::Style::default();
+            style.color = Some(theme.palette().danger);
+            style
+        }),
+        column![
+            text("BPM").size(14).style(secondary_text),
+            text(match stats.trend(10) {
+                Some(d) if d >= 3 => format!("↑ {:+}", d),
+                Some(d) if d <= -3 => format!("↓ {:+}", d),
+                Some(d) => format!("→ {:+}", d),
+                None => String::new(),
+            })
+            .size(12)
+            .style(secondary_text),
+        ],
+        Space::new().width(Length::Fill),
+        text(if stats.monitoring {
+            if stats.count == 0 {
+                "Waiting for readings…"
+            } else {
+                "Live"
+            }
+        } else {
+            "Stopped"
+        })
+        .size(12)
+        .style(secondary_text),
+    ]
+    .align_y(Center)
+    .spacing(8);
+
+    let duration = stats
+        .duration()
+        .map(|d| {
+            let secs = d.as_secs();
+            format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    let reset_button = {
+        let aacp_manager = aacp_manager.clone();
+        let mac = mac.to_string();
+        let state = state.clone();
+        button(text("Reset Statistics").size(14))
+            .style(|theme: &Theme, _status| {
+                let mut style = Style::default();
+                style.text_color = theme.palette().primary;
+                style.background = Some(Background::Color(Color::TRANSPARENT));
+                style
+            })
+            .padding(0)
+            .on_press_with(move || {
+                let aacp_manager = aacp_manager.clone();
+                run_async_in_thread(async move {
+                    aacp_manager.reset_heart_rate_stats().await;
+                });
+                let mut state = state.clone();
+                state.heart_rate.reset();
+                Message::StateChanged(mac.clone(), DeviceState::AirPods(state))
+            })
+    };
+
+    let mut rows = column![toggle, separator(), current]
+        .spacing(4)
+        .padding(8);
+    if let Some(graph) = heart_rate_graph(stats) {
+        rows = rows.push(graph);
+    }
+    rows = rows.push(separator()).extend([
+        stat_row("Average", bpm_text(stats.average())).into(),
+        stat_row("Last 30 Readings", bpm_text(stats.recent_average(30))).into(),
+        stat_row("Minimum", bpm_text(stats.min.map(f64::from))).into(),
+        stat_row("Maximum", bpm_text(stats.max.map(f64::from))).into(),
+        stat_row("Readings", stats.count.to_string()).into(),
+        stat_row("Duration", duration).into(),
+        row![Space::new().width(Length::Fill), reset_button].into(),
+    ]);
+
+    column![
+        container(text("Heart Rate").size(18).style(|theme: &Theme| {
+            let mut style = text::Style::default();
+            style.color = Some(theme.palette().primary);
+            style
+        }))
+        .padding(Padding {
+            top: 5.0,
+            bottom: 5.0,
+            left: 18.0,
+            right: 18.0,
+        }),
+        container(rows)
+            .padding(Padding {
+                top: 5.0,
+                bottom: 5.0,
+                left: 10.0,
+                right: 10.0,
+            })
+            .style(|theme: &Theme| {
+                let mut style = container::Style::default();
+                style.background =
+                    Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+                let mut border = Border::default();
+                border.color = theme.palette().primary.scale_alpha(0.5);
+                style.border = border.rounded(16);
+                style
+            })
+    ]
+}
+
+/// Simple bar graph of the recent heart rate history.
+fn heart_rate_graph<'a>(stats: &HeartRateStats) -> Option<iced::widget::Container<'a, Message>> {
+    const GRAPH_HEIGHT: f32 = 60.0;
+    let lo = stats.history.iter().map(|s| s.bpm).min()?.saturating_sub(5) as f32;
+    let hi = stats.history.iter().map(|s| s.bpm).max()?.saturating_add(5) as f32;
+    let bars = stats.history.iter().map(|sample| {
+        let height = ((sample.bpm as f32 - lo) / (hi - lo)).clamp(0.05, 1.0) * GRAPH_HEIGHT;
+        container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(height))
+            .style(|theme: &Theme| {
+                let mut style = container::Style::default();
+                style.background = Some(Background::Color(theme.palette().danger.scale_alpha(0.7)));
+                style.border = Border::default().rounded(1);
+                style
+            })
+            .into()
+    });
+    let padding = HISTORY_LEN.saturating_sub(stats.history.len());
+    let graph = Row::with_children(
+        std::iter::repeat_with(|| Space::new().width(Length::Fill).into())
+            .take(padding)
+            .chain(bars),
+    )
+    .spacing(1)
+    .height(Length::Fixed(GRAPH_HEIGHT))
+    .align_y(Bottom);
+    Some(container(graph).padding(Padding {
+        top: 4.0,
+        bottom: 4.0,
+        left: 0.0,
+        right: 0.0,
+    }))
 }
 
 fn run_async_in_thread<F>(fut: F)

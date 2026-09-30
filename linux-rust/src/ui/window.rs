@@ -382,6 +382,7 @@ impl App {
                                         status.identifier == ControlCommandIdentifiers::AllowOffOption &&
                                         matches!(status.value.as_slice(), [0x01])
                                     }),
+                                    heart_rate: state.heart_rate.clone(),
                                 }));
                             }
                             Some(DeviceType::Nothing) => {
@@ -515,6 +516,13 @@ impl App {
                                 {
                                     state.battery = battery_info;
                                     debug!("Updated battery info for {}: {:?}", mac, state.battery);
+                                }
+                            }
+                            AACPEvent::HeartRate(stats) => {
+                                if let Some(DeviceState::AirPods(state)) =
+                                    self.device_states.get_mut(&mac)
+                                {
+                                    state.heart_rate = stats;
                                 }
                             }
                             _ => {}

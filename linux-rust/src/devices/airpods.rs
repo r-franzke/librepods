@@ -45,6 +45,7 @@ impl AirPodsDevice {
                     tray.battery_r_status = None;
                     tray.battery_c = None;
                     tray.battery_c_status = None;
+                    tray.heart_rate = None;
                 })
                 .await;
         }
@@ -374,6 +375,18 @@ impl AirPodsDevice {
                         } else {
                             debug!("Stem control disabled, ignoring stem press event");
                         }
+                    }
+                    AACPEvent::HeartRate(stats) => {
+                        if let Some(handle) = &tray_handle {
+                            let bpm = if stats.monitoring { stats.current() } else { None };
+                            handle
+                                .update(|tray: &mut MyTray| tray.heart_rate = bpm)
+                                .await;
+                        }
+                        let _ = ui_tx_clone.send(BluetoothUIMessage::AACPUIEvent(
+                            mac_address.to_string(),
+                            event_clone,
+                        ));
                     }
                     _ => {
                         debug!("Received unhandled AACP event: {:?}", event);
