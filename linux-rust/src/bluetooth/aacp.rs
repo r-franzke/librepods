@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
@@ -366,7 +366,15 @@ impl AACPManagerState {
 pub struct AACPManager {
     pub state: Arc<Mutex<AACPManagerState>>,
     tasks: Arc<Mutex<JoinSet<()>>>,
-    sensor_sequence: Arc<AtomicU32>,
+    heart_rate_session: Arc<Mutex<Option<HeartRateSession>>>,
+    heart_rate_session_id: Arc<AtomicU64>,
+}
+
+/// Dedicated L2CAP channel used for heart rate streaming, see `heart_rate.rs`.
+struct HeartRateSession {
+    id: u64,
+    socket: Arc<SeqPacket>,
+    reader: tokio::task::JoinHandle<()>,
 }
 
 impl AACPManager {
@@ -374,7 +382,8 @@ impl AACPManager {
         AACPManager {
             state: Arc::new(Mutex::new(AACPManagerState::new())),
             tasks: Arc::new(Mutex::new(JoinSet::new())),
-            sensor_sequence: Arc::new(AtomicU32::new(heart_rate::INITIAL_SEQUENCE)),
+            heart_rate_session: Arc::new(Mutex::new(None)),
+            heart_rate_session_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -924,18 +933,6 @@ impl AACPManager {
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
             }
-            heart_rate::SENSOR_DATA_OPCODE => {
-                if let Some(bpm) = heart_rate::parse_heart_rate_packet(packet) {
-                    let mut state = self.state.lock().await;
-                    state.heart_rate.add_sample(bpm);
-                    if let Some(ref tx) = state.event_tx {
-                        let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
-                    }
-                    info!("Received Heart Rate: {} bpm", bpm);
-                } else {
-                    debug!("Received sensor data packet: {}", hex::encode(payload));
-                }
-            }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
     }
@@ -1215,46 +1212,94 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    async fn send_heart_rate_service_setting(&self, interval: Duration) -> Result<()> {
-        let sequence = self.sensor_sequence.fetch_add(1, Ordering::Relaxed);
-        let packet = heart_rate::build_service_setting_packet(sequence, interval);
-        self.send_data_packet(&packet).await
+    async fn update_heart_rate(&self, update: impl FnOnce(&mut HeartRateStats)) {
+        let mut state = self.state.lock().await;
+        update(&mut state.heart_rate);
+        if let Some(ref tx) = state.event_tx {
+            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+        }
     }
 
-    /// Enables the heart rate monitor and starts streaming samples (one per second).
+    /// Opens a dedicated AACP channel and starts heart rate streaming, replicating the working
+    /// Android implementation (see `heart_rate.rs`).
     pub async fn start_heart_rate_monitoring(&self) -> Result<()> {
-        info!("Starting heart rate monitoring");
-        self.send_control_command(ControlCommandIdentifiers::HrmState, &[0x01])
-            .await?;
-        sleep(Duration::from_millis(120)).await;
-        self.send_heart_rate_service_setting(heart_rate::DEFAULT_INTERVAL)
-            .await?;
-        let mut state = self.state.lock().await;
-        state.heart_rate.monitoring = true;
-        if let Some(ref tx) = state.event_tx {
-            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+        let mut session = self.heart_rate_session.lock().await;
+        if session.is_some() {
+            return Ok(());
         }
-        Ok(())
+        let addr = self.state.lock().await.airpods_mac;
+        let result = match addr {
+            Some(addr) => self.open_heart_rate_session(addr).await,
+            None => Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "AirPods not connected",
+            ))),
+        };
+        match result {
+            Ok(new_session) => {
+                *session = Some(new_session);
+                self.update_heart_rate(|hr| {
+                    hr.monitoring = true;
+                    hr.error = None;
+                })
+                .await;
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to start heart rate monitoring: {}", e);
+                let message = format!("Failed to start: {}", e);
+                self.update_heart_rate(|hr| {
+                    hr.monitoring = false;
+                    hr.error = Some(message);
+                })
+                .await;
+                Err(e)
+            }
+        }
     }
 
-    /// Stops the heart rate stream. Collected statistics are kept.
-    pub async fn stop_heart_rate_monitoring(&self) -> Result<()> {
-        info!("Stopping heart rate monitoring");
-        let result = self.send_heart_rate_service_setting(Duration::ZERO).await;
-        let mut state = self.state.lock().await;
-        state.heart_rate.monitoring = false;
-        if let Some(ref tx) = state.event_tx {
-            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
+    async fn open_heart_rate_session(&self, addr: Address) -> Result<HeartRateSession> {
+        info!("Opening heart rate L2CAP channel to {} on PSM {:#06X}", addr, PSM);
+        let socket = Arc::new(open_l2cap(addr).await?);
+        let id = self.heart_rate_session_id.fetch_add(1, Ordering::Relaxed);
+        // Start listening before sending anything, like the Android implementation.
+        let reader = tokio::spawn(heart_rate_recv_thread(self.clone(), socket.clone(), id));
+        for (packet, delay, label) in heart_rate::START_SEQUENCE {
+            info!("Heart rate TX {}: {}", label, hex::encode(packet));
+            if let Err(e) = send_with_retry(&socket, packet).await {
+                reader.abort();
+                return Err(e.into());
+            }
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
         }
+        Ok(HeartRateSession { id, socket, reader })
+    }
+
+    /// Stops heart rate streaming and closes the dedicated channel. Statistics are kept.
+    pub async fn stop_heart_rate_monitoring(&self) -> Result<()> {
+        let session = self.heart_rate_session.lock().await.take();
+        let result = match session {
+            Some(session) => {
+                info!("Heart rate TX stop: {}", hex::encode(heart_rate::HR_STOP));
+                let result = send_with_retry(&session.socket, &heart_rate::HR_STOP).await;
+                // Give the stop packet a moment to go out before the channel is closed.
+                sleep(Duration::from_millis(100)).await;
+                session.reader.abort();
+                result.map_err(Error::from)
+            }
+            None => Ok(()),
+        };
+        if let Err(ref e) = result {
+            error!("Failed to send heart rate stop: {}", e);
+        }
+        self.update_heart_rate(|hr| hr.monitoring = false).await;
         result
     }
 
     pub async fn reset_heart_rate_stats(&self) {
-        let mut state = self.state.lock().await;
-        state.heart_rate.reset();
-        if let Some(ref tx) = state.event_tx {
-            let _ = tx.send(AACPEvent::HeartRate(state.heart_rate.clone()));
-        }
+        self.update_heart_rate(|hr| hr.reset()).await;
     }
 
     pub async fn send_some_packet(&self) -> Result<()> {
@@ -1285,13 +1330,80 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 state.owns = false;
                 state.connected_devices.clear();
                 state.control_command_status_list.clear();
-                state.heart_rate.monitoring = false;
                 break;
             }
         }
     }
     let mut state = manager.state.lock().await;
     state.sender = None;
+}
+
+async fn open_l2cap(addr: Address) -> std::io::Result<SeqPacket> {
+    let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM);
+    let socket = Socket::new_seq_packet()?;
+    let seq_packet = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target_sa))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "L2CAP connect timed out"))??;
+    let start = Instant::now();
+    loop {
+        match seq_packet.peer_addr() {
+            Ok(peer) if peer.cid != 0 => return Ok(seq_packet),
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(107) => return Err(e),
+            Err(e) => error!("Error getting peer address: {}", e),
+        }
+        if start.elapsed() >= CONNECT_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "L2CAP connection not established",
+            ));
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn send_with_retry(sp: &SeqPacket, data: &[u8]) -> std::io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match sp.send(data).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(107) && attempts < 10 => {
+                attempts += 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn heart_rate_recv_thread(manager: AACPManager, sp: Arc<SeqPacket>, id: u64) {
+    let mut buf = vec![0u8; heart_rate::RECV_BUFFER_SIZE];
+    let reason = loop {
+        match sp.recv(&mut buf).await {
+            Ok(0) => break "Heart rate channel closed by AirPods".to_string(),
+            Ok(n) => {
+                let data = &buf[..n];
+                debug!("Heart rate RX {} bytes: {}", n, hex::encode(data));
+                for bpm in heart_rate::parse_heart_rate_samples(data) {
+                    info!("Received Heart Rate: {} bpm", bpm);
+                    manager.update_heart_rate(|hr| hr.add_sample(bpm)).await;
+                }
+            }
+            Err(e) => break format!("Heart rate channel error: {}", e),
+        }
+    };
+    info!("{}", reason);
+    let mut session = manager.heart_rate_session.lock().await;
+    if session.as_ref().is_some_and(|s| s.id == id) {
+        session.take();
+        drop(session);
+        manager
+            .update_heart_rate(|hr| {
+                hr.monitoring = false;
+                hr.error = Some(reason);
+            })
+            .await;
+    }
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {

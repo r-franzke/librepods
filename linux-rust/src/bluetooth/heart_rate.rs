@@ -1,175 +1,278 @@
 //! Heart rate streaming over AACP (RTBuddy `SensorDataWX`, service `HEARTRATE(19)`).
 //!
-//! Protocol reverse engineered in https://github.com/tomppi/airpods_rtbuddy_v37_probe:
+//! This is a port of the working Android (Xposed) implementation in
+//! https://github.com/tomppi/airpods_rtbuddy_v37_probe (`runLiveHrStream`, v39). The packets,
+//! their order and the delays between them are copied verbatim:
 //!
-//! 1. Enable the heart rate monitor with control command `0x30` (HrmState) = `0x01`.
-//! 2. Send an RTBuddy `SensorDataWX` frame (AACP opcode `0x17`, descriptor `0x00100000`)
-//!    containing a `ServiceSetting` for `HEARTRATE(19)` with the desired sample interval.
-//! 3. The AirPods then stream `SensorDataWX` frames whose `Command` (field 7) carries an
-//!    18 byte payload for `HEARTRATE(19)`. `payload[1]` is the heart rate in bpm.
-//! 4. To stop, send the same `ServiceSetting` with an interval of `0`.
-//!
-//! `SensorDataWX` frame layout (after the `04 00 04 00` AACP header):
-//!
-//! ```text
-//! 17 00 | 00 00 10 00 (descriptor, LE32) | LL LL (payload length, LE16) | protobuf payload
-//! ```
+//! 1. Open a dedicated L2CAP channel on PSM `0x1001`.
+//! 2. AACP Connect service 0, Capabilities Request service 0, AACP Connect service 4,
+//!    Capabilities Request service 4 (180/220/180/220 ms apart).
+//! 3. Control command `0x30` (Heart Rate Monitor) = enabled, wait 120 ms.
+//! 4. One RTBuddy `SensorDataWX` `ServiceSetting(HEARTRATE(19), interval = 1 s)`, seq `0x2363`.
+//! 5. Listen passively. Valid samples have service `HEARTRATE(19)`, an 18 byte command
+//!    payload, outer log type `3` and status tail `10 00 00`; `payload[1]` is the bpm.
+//! 6. On stop, send the same `ServiceSetting` with interval `0` (seq `0x236D`) and close.
 
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
 
-pub const SENSOR_DATA_OPCODE: u8 = 0x17;
-pub const DESCRIPTOR_SENSOR_DATA_WX: u32 = 0x0010_0000;
-pub const SERVICE_HEARTRATE: u64 = 19;
+/// AACP Connect: `<type 0000><service><major 0001><minor 0003><features64>`.
+pub const AACP_CONNECT_SERVICE0: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+pub const AACP_CAPS_REQ_SERVICE0: [u8; 7] = [0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+pub const AACP_CONNECT_SERVICE4: [u8; 16] = [
+    0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+pub const AACP_CAPS_REQ_SERVICE4: [u8; 7] = [0x04, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00];
+/// Control command `0x30` (HrmState) = `0x01`.
+pub const HRM_ENABLE: [u8; 11] = [
+    0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x30, 0x01, 0x00, 0x00, 0x00,
+];
+/// `SensorDataWX { seq: 0x2363, ServiceSetting { HEARTRATE, 2, [01, 1_000_000 us LE32] } }`.
+pub const HR_START_1S: [u8; 28] = [
+    0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x08, 0xE3, 0x46, 0x42,
+    0x0B, 0x08, 0x13, 0x10, 0x02, 0x1A, 0x05, 0x01, 0x40, 0x42, 0x0F, 0x00,
+];
+/// `SensorDataWX { seq: 0x236D, ServiceSetting { HEARTRATE, 2, [01, 0 us] } }`.
+pub const HR_STOP: [u8; 28] = [
+    0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x08, 0xED, 0x46, 0x42,
+    0x0B, 0x08, 0x13, 0x10, 0x02, 0x1A, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
+];
 
-/// Sequence id the probe used for its (working) start packet; later packets just increment it.
-pub const INITIAL_SEQUENCE: u32 = 0x2363;
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
+/// Packets sent to start streaming, each followed by the given delay.
+pub const START_SEQUENCE: [(&[u8], Duration, &str); 6] = [
+    (
+        &AACP_CONNECT_SERVICE0,
+        Duration::from_millis(180),
+        "AACP connect service 0",
+    ),
+    (
+        &AACP_CAPS_REQ_SERVICE0,
+        Duration::from_millis(220),
+        "AACP capabilities request service 0",
+    ),
+    (
+        &AACP_CONNECT_SERVICE4,
+        Duration::from_millis(180),
+        "AACP connect service 4",
+    ),
+    (
+        &AACP_CAPS_REQ_SERVICE4,
+        Duration::from_millis(220),
+        "AACP capabilities request service 4",
+    ),
+    (
+        &HRM_ENABLE,
+        Duration::from_millis(120),
+        "heart rate monitor enable",
+    ),
+    (
+        &HR_START_1S,
+        Duration::ZERO,
+        "HEARTRATE(19) start, interval 1s",
+    ),
+];
 
-const HR_PAYLOAD_LEN: usize = 18;
-const VALID_LOG_TYPE: u64 = 3;
-const VALID_STATUS_TAIL: [u8; 3] = [0x10, 0x00, 0x00];
-const MIN_BPM: u8 = 30;
-const MAX_BPM: u8 = 220;
+pub const RECV_BUFFER_SIZE: usize = 4096;
+
+const RTBUDDY_OPCODE: u16 = 0x0017;
+const DESCRIPTOR_SENSOR_DATA_WX: i32 = 0x0010_0000;
+const SERVICE_HEARTRATE: i64 = 19;
 
 /// Number of samples kept for the history graph.
 pub const HISTORY_LEN: usize = 120;
 
-fn write_varint(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
+fn le16(data: &[u8], off: usize) -> i32 {
+    match data.get(off..off + 2) {
+        Some(b) => u16::from_le_bytes([b[0], b[1]]) as i32,
+        None => -1,
     }
 }
 
-fn read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+fn le32(data: &[u8], off: usize) -> i32 {
+    match data.get(off..off + 4) {
+        Some(b) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        None => -1,
+    }
+}
+
+/// Reads a varint from `data[start..end]`, returning `(value, next)`.
+fn read_varint(data: &[u8], start: usize, end: usize) -> Option<(u64, usize)> {
     let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        let byte = *data.get(*pos)?;
-        *pos += 1;
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
+    let mut shift = 0;
+    let mut i = start;
+    while i < end && shift < 64 {
+        let b = data[i];
+        i += 1;
+        value |= ((b & 0x7F) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some((value, i));
         }
+        shift += 7;
     }
     None
 }
 
-enum Field<'a> {
-    Varint(u64),
-    Bytes(&'a [u8]),
-    Other,
-}
-
-/// Iterates the top level fields of a protobuf message, stopping at the first malformed field.
-fn fields(data: &[u8]) -> impl Iterator<Item = (u64, Field<'_>)> {
+/// Splits a received chunk into AACP frames (`04 00 04 00`, 12 byte header with the length at
+/// offset 10). A trailing partial frame is returned as-is.
+pub fn extract_aacp_frames(rx: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    if rx.len() < 12 {
+        return out;
+    }
     let mut pos = 0;
-    std::iter::from_fn(move || {
-        if pos >= data.len() {
-            return None;
-        }
-        let key = read_varint(data, &mut pos)?;
-        let field = key >> 3;
-        let value = match key & 7 {
-            0 => Field::Varint(read_varint(data, &mut pos)?),
-            2 => {
-                let len = read_varint(data, &mut pos)? as usize;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let bytes = &data[pos..end];
-                pos = end;
-                Field::Bytes(bytes)
-            }
-            1 => {
-                pos += 8;
-                Field::Other
-            }
-            5 => {
-                pos += 4;
-                Field::Other
-            }
-            _ => return None,
+    while pos + 12 <= rx.len() {
+        let Some(off) = (pos..=rx.len() - 12).find(|&i| rx[i..i + 4] == [0x04, 0x00, 0x04, 0x00])
+        else {
+            break;
         };
-        Some((field, value))
-    })
-}
-
-/// Builds the AACP data (without the `04 00 04 00` header) for an RTBuddy `ServiceSetting`
-/// for `HEARTRATE(19)`. An interval of zero stops the stream.
-pub fn build_service_setting_packet(sequence: u32, interval: Duration) -> Vec<u8> {
-    let interval_us = interval.as_micros().min(u32::MAX as u128) as u32;
-
-    // ServiceSetting { 1: service, 2: mode, 3: [0x01, interval_us LE32] }
-    let mut setting = Vec::new();
-    setting.extend_from_slice(&[0x08]);
-    write_varint(&mut setting, SERVICE_HEARTRATE);
-    setting.extend_from_slice(&[0x10, 0x02, 0x1A, 0x05, 0x01]);
-    setting.extend_from_slice(&interval_us.to_le_bytes());
-
-    // SensorDataWX { 1: sequence, 8: ServiceSetting }
-    let mut payload = vec![0x08];
-    write_varint(&mut payload, sequence as u64);
-    payload.push(0x42);
-    write_varint(&mut payload, setting.len() as u64);
-    payload.extend_from_slice(&setting);
-
-    let mut packet = vec![SENSOR_DATA_OPCODE, 0x00];
-    packet.extend_from_slice(&DESCRIPTOR_SENSOR_DATA_WX.to_le_bytes());
-    packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-    packet.extend_from_slice(&payload);
-    packet
-}
-
-/// Parses a full AACP packet (including the `04 00 04 00` header) and returns the heart rate if
-/// it is a validated RTBuddy `HEARTRATE(19)` sample. Startup/transient frames are rejected.
-pub fn parse_heart_rate_packet(packet: &[u8]) -> Option<u8> {
-    if packet.len() < 12 || packet[4] != SENSOR_DATA_OPCODE || packet[5] != 0x00 {
-        return None;
-    }
-    let descriptor = u32::from_le_bytes(packet[6..10].try_into().ok()?);
-    if descriptor != DESCRIPTOR_SENSOR_DATA_WX {
-        return None;
-    }
-    let declared = u16::from_le_bytes([packet[10], packet[11]]) as usize;
-    let end = packet.len().min(12 + declared);
-    let payload = &packet[12..end];
-
-    let mut log_type = None;
-    let mut command = None;
-    for (field, value) in fields(payload) {
-        match (field, value) {
-            (2, Field::Varint(v)) => log_type = Some(v),
-            (7, Field::Bytes(b)) if command.is_none() => command = Some(b),
-            _ => {}
+        let frame_len = 12 + u16::from_le_bytes([rx[off + 10], rx[off + 11]]) as usize;
+        if off + frame_len <= rx.len() {
+            out.push(&rx[off..off + frame_len]);
+            pos = off + frame_len;
+        } else {
+            out.push(&rx[off..]);
+            break;
         }
     }
-    if log_type != Some(VALID_LOG_TYPE) {
+    out
+}
+
+#[derive(Debug, Default)]
+struct RtBuddyFrame {
+    descriptor: i32,
+    log_type: i64,
+    cmd_service: i64,
+    cmd_payload: Option<Vec<u8>>,
+    decoded_bpm: i32,
+    decoded_valid: bool,
+}
+
+fn parse_rtbuddy_frame(frame: &[u8]) -> Option<RtBuddyFrame> {
+    if frame.len() < 12 {
         return None;
     }
+    if le16(frame, 0) != 0x0004 || le16(frame, 2) != 0x0004 || le16(frame, 4) != 0x0017 {
+        return None;
+    }
+    let mut rt = RtBuddyFrame {
+        descriptor: le32(frame, 6),
+        log_type: -1,
+        cmd_service: -1,
+        decoded_bpm: -1,
+        ..Default::default()
+    };
+    let declared = le16(frame, 10);
+    let start = 12;
+    let mut end = frame.len().min(start + declared.max(0) as usize);
+    if end < start {
+        end = frame.len();
+    }
+    if rt.descriptor == DESCRIPTOR_SENSOR_DATA_WX {
+        parse_sensor_data_wx(frame, start, end, &mut rt);
+    }
+    Some(rt)
+}
 
-    // Command { 1: service, 3: payload }
-    let mut service = None;
-    let mut hr_payload = None;
-    for (field, value) in fields(command?) {
-        match (field, value) {
-            (1, Field::Varint(v)) => service = Some(v),
-            (3, Field::Bytes(b)) if hr_payload.is_none() && !b.is_empty() => hr_payload = Some(b),
-            _ => {}
+fn parse_sensor_data_wx(data: &[u8], start: usize, end: usize, rt: &mut RtBuddyFrame) {
+    let mut i = start;
+    while i < end {
+        let Some((key, next)) = read_varint(data, i, end) else {
+            break;
+        };
+        i = next;
+        let field = key >> 3;
+        match key & 7 {
+            0 => {
+                let Some((val, next)) = read_varint(data, i, end) else {
+                    break;
+                };
+                i = next;
+                if field == 2 {
+                    rt.log_type = val as i64;
+                }
+            }
+            2 => {
+                let Some((len, next)) = read_varint(data, i, end) else {
+                    break;
+                };
+                i = next;
+                let sub_end = end.min(i.saturating_add(len as usize));
+                if field == 7 {
+                    parse_command(data, i, sub_end, rt);
+                }
+                i = sub_end;
+            }
+            1 => i = end.min(i + 8),
+            5 => i = end.min(i + 4),
+            _ => break,
         }
     }
-    let hr_payload = hr_payload?;
-    if service != Some(SERVICE_HEARTRATE)
-        || hr_payload.len() != HR_PAYLOAD_LEN
-        || hr_payload[15..18] != VALID_STATUS_TAIL
-    {
-        return None;
+}
+
+fn parse_command(data: &[u8], start: usize, end: usize, rt: &mut RtBuddyFrame) {
+    let mut i = start;
+    while i < end {
+        let Some((key, next)) = read_varint(data, i, end) else {
+            return;
+        };
+        i = next;
+        let field = key >> 3;
+        match key & 7 {
+            0 => {
+                let Some((val, next)) = read_varint(data, i, end) else {
+                    return;
+                };
+                i = next;
+                if field == 1 {
+                    rt.cmd_service = val as i64;
+                }
+            }
+            2 => {
+                let Some((len, next)) = read_varint(data, i, end) else {
+                    return;
+                };
+                i = next;
+                let sub_end = end.min(i.saturating_add(len as usize));
+                if field == 3 && sub_end > i && rt.cmd_payload.is_none() {
+                    rt.cmd_payload = Some(data[i..sub_end].to_vec());
+                }
+                i = sub_end;
+            }
+            1 => i = end.min(i + 8),
+            5 => i = end.min(i + 4),
+            _ => return,
+        }
     }
-    let bpm = hr_payload[1];
-    (MIN_BPM..=MAX_BPM).contains(&bpm).then_some(bpm)
+    decode_heart_rate(rt);
+}
+
+fn decode_heart_rate(rt: &mut RtBuddyFrame) {
+    let Some(payload) = &rt.cmd_payload else {
+        return;
+    };
+    let n = payload.len();
+    let bpm = if n > 1 { payload[1] as i32 } else { -1 };
+    rt.decoded_bpm = bpm;
+    let good_tail = n >= 18 && payload[15] == 0x10 && payload[16] == 0x00 && payload[17] == 0x00;
+    rt.decoded_valid = rt.descriptor == DESCRIPTOR_SENSOR_DATA_WX
+        && rt.cmd_service == SERVICE_HEARTRATE
+        && n == 18
+        && rt.log_type == 3
+        && good_tail
+        && (30..=220).contains(&bpm);
+}
+
+/// Returns every validated heart rate sample (bpm) contained in a received chunk.
+pub fn parse_heart_rate_samples(rx: &[u8]) -> Vec<u8> {
+    extract_aacp_frames(rx)
+        .into_iter()
+        .filter(|frame| frame.len() >= 12 && le16(frame, 4) == RTBUDDY_OPCODE as i32)
+        .filter_map(parse_rtbuddy_frame)
+        .filter(|rt| rt.decoded_valid)
+        .map(|rt| rt.decoded_bpm as u8)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +291,8 @@ pub struct HeartRateStats {
     pub max: Option<u8>,
     pub started_at: Option<SystemTime>,
     pub history: VecDeque<HeartRateSample>,
+    /// Why monitoring last failed or stopped unexpectedly.
+    pub error: Option<String>,
 }
 
 impl HeartRateStats {
@@ -255,90 +360,88 @@ impl HeartRateStats {
 mod tests {
     use super::*;
 
-    fn header(data: &[u8]) -> Vec<u8> {
-        [&[0x04, 0x00, 0x04, 0x00][..], data].concat()
+    fn hex(s: &str) -> Vec<u8> {
+        hex::decode(s.replace(' ', "")).unwrap()
     }
 
     /// Builds a streamed heart rate frame the way the AirPods send it.
-    fn hr_frame(seq: u32, log_type: u8, bpm: u8, tail: [u8; 3]) -> Vec<u8> {
-        let mut hr = vec![0u8; HR_PAYLOAD_LEN];
+    fn hr_frame(log_type: u8, bpm: u8, tail: [u8; 3]) -> Vec<u8> {
+        let mut hr = vec![0u8; 18];
         hr[1] = bpm;
         hr[15..18].copy_from_slice(&tail);
-        let mut command = vec![0x08, SERVICE_HEARTRATE as u8, 0x1A, hr.len() as u8];
+        let mut command = vec![0x08, 0x13, 0x1A, hr.len() as u8];
         command.extend_from_slice(&hr);
-        let mut payload = vec![0x08];
-        write_varint(&mut payload, seq as u64);
-        payload.extend_from_slice(&[0x10, log_type, 0x3A, command.len() as u8]);
+        let mut payload = vec![0x08, 0x80, 0x48, 0x10, log_type, 0x3A, command.len() as u8];
         payload.extend_from_slice(&command);
-        let mut data = vec![SENSOR_DATA_OPCODE, 0x00, 0x00, 0x00, 0x10, 0x00];
-        data.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-        data.extend_from_slice(&payload);
-        header(&data)
+        let mut frame = vec![0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x10, 0x00];
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
     }
 
     #[test]
-    fn start_packet_matches_probe() {
-        let expected =
-            hex::decode("170000001000100008e346420b0813100 21a050140420f00".replace(' ', ""))
-                .unwrap();
+    fn packets_match_android_implementation() {
         assert_eq!(
-            build_service_setting_packet(0x2363, Duration::from_secs(1)),
-            expected
+            AACP_CONNECT_SERVICE0.to_vec(),
+            hex("00 00 00 00 01 00 03 00 00 00 00 00 00 00 00 00")
         );
-    }
-
-    #[test]
-    fn stop_packet_matches_probe() {
-        let expected =
-            hex::decode("170000001000100008ed46420b08131002 1a05010000 0000".replace(' ', ""))
-                .unwrap();
         assert_eq!(
-            build_service_setting_packet(0x236D, Duration::ZERO),
-            expected
+            AACP_CONNECT_SERVICE4.to_vec(),
+            hex("00 00 04 00 01 00 03 00 00 00 00 00 00 00 00 00")
+        );
+        assert_eq!(AACP_CAPS_REQ_SERVICE0.to_vec(), hex("04 00 00 00 01 00 00"));
+        assert_eq!(AACP_CAPS_REQ_SERVICE4.to_vec(), hex("04 00 04 00 01 00 00"));
+        assert_eq!(HRM_ENABLE.to_vec(), hex("04 00 04 00 09 00 30 01 00 00 00"));
+        assert_eq!(
+            HR_START_1S.to_vec(),
+            hex(
+                "04 00 04 00 17 00 00 00 10 00 10 00 08 E3 46 42 0B 08 13 10 02 1A 05 01 40 42 0F 00"
+            )
+        );
+        assert_eq!(
+            HR_STOP.to_vec(),
+            hex(
+                "04 00 04 00 17 00 00 00 10 00 10 00 08 ED 46 42 0B 08 13 10 02 1A 05 01 00 00 00 00"
+            )
         );
     }
 
     #[test]
     fn parses_valid_sample() {
-        let frame = hr_frame(0x2400, 3, 72, VALID_STATUS_TAIL);
-        assert_eq!(parse_heart_rate_packet(&frame), Some(72));
+        let frame = hr_frame(3, 72, [0x10, 0x00, 0x00]);
+        assert_eq!(parse_heart_rate_samples(&frame), vec![72]);
+    }
+
+    #[test]
+    fn parses_concatenated_frames() {
+        let mut rx = hr_frame(3, 72, [0x10, 0x00, 0x00]);
+        rx.extend_from_slice(&[
+            0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        rx.extend_from_slice(&hr_frame(3, 75, [0x10, 0x00, 0x00]));
+        assert_eq!(parse_heart_rate_samples(&rx), vec![72, 75]);
     }
 
     #[test]
     fn rejects_transient_frames() {
-        assert_eq!(
-            parse_heart_rate_packet(&hr_frame(1, 3, 72, [0x10, 0x82, 0x81])),
-            None
-        );
-        assert_eq!(
-            parse_heart_rate_packet(&hr_frame(1, 3, 72, [0x10, 0x02, 0x81])),
-            None
-        );
-        assert_eq!(
-            parse_heart_rate_packet(&hr_frame(1, 2, 72, VALID_STATUS_TAIL)),
-            None
-        );
-        assert_eq!(
-            parse_heart_rate_packet(&hr_frame(1, 3, 0, VALID_STATUS_TAIL)),
-            None
-        );
-        assert_eq!(
-            parse_heart_rate_packet(&hr_frame(1, 3, 250, VALID_STATUS_TAIL)),
-            None
-        );
+        for frame in [
+            hr_frame(3, 72, [0x10, 0x82, 0x81]),
+            hr_frame(3, 72, [0x10, 0x02, 0x81]),
+            hr_frame(2, 72, [0x10, 0x00, 0x00]),
+            hr_frame(3, 29, [0x10, 0x00, 0x00]),
+            hr_frame(3, 221, [0x10, 0x00, 0x00]),
+        ] {
+            assert!(parse_heart_rate_samples(&frame).is_empty());
+        }
     }
 
     #[test]
     fn rejects_other_packets() {
-        let start = header(&build_service_setting_packet(1, DEFAULT_INTERVAL));
-        assert_eq!(parse_heart_rate_packet(&start), None);
-        assert_eq!(
-            parse_heart_rate_packet(&[0x04, 0x00, 0x04, 0x00, 0x17]),
-            None
-        );
-        let mut truncated = hr_frame(1, 3, 72, VALID_STATUS_TAIL);
+        assert!(parse_heart_rate_samples(&HR_START_1S).is_empty());
+        assert!(parse_heart_rate_samples(&HRM_ENABLE).is_empty());
+        let mut truncated = hr_frame(3, 72, [0x10, 0x00, 0x00]);
         truncated.truncate(truncated.len() - 4);
-        assert_eq!(parse_heart_rate_packet(&truncated), None);
+        assert!(parse_heart_rate_samples(&truncated).is_empty());
     }
 
     #[test]

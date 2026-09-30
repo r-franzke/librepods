@@ -593,6 +593,7 @@ fn heart_rate_section<'a>(
                     });
                     let mut state = state.clone();
                     state.heart_rate.monitoring = is_enabled;
+                    state.heart_rate.error = None;
                     Message::StateChanged(mac.clone(), DeviceState::AirPods(state))
                 })
                 .spacing(0)
@@ -629,7 +630,7 @@ fn heart_rate_section<'a>(
         Space::new().width(Length::Fill),
         text(if stats.monitoring {
             if stats.count == 0 {
-                "Waiting for readings…"
+                "Connecting / waiting for readings…"
             } else {
                 "Live"
             }
@@ -673,9 +674,15 @@ fn heart_rate_section<'a>(
             })
     };
 
-    let mut rows = column![toggle, separator(), current]
-        .spacing(4)
-        .padding(8);
+    let mut rows = column![toggle].spacing(4).padding(8);
+    if let Some(error) = &stats.error {
+        rows = rows.push(text(error.clone()).size(12).style(|theme: &Theme| {
+            let mut style = text::Style::default();
+            style.color = Some(theme.palette().danger);
+            style
+        }));
+    }
+    rows = rows.push(separator()).push(current);
     if let Some(graph) = heart_rate_graph(stats) {
         rows = rows.push(graph);
     }
