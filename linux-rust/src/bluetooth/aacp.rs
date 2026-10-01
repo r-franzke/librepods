@@ -1288,19 +1288,21 @@ impl AACPManager {
         info!("Opening heart rate L2CAP channel to {} on PSM {:#06X}", addr, PSM);
         let socket = Arc::new(open_l2cap(addr).await?);
         let id = self.heart_rate_session_id.fetch_add(1, Ordering::Relaxed);
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
         // Start listening before sending anything, like the Android implementation.
-        let reader = tokio::spawn(heart_rate_recv_thread(self.clone(), socket.clone(), id));
-        for (packet, delay, label) in heart_rate::START_SEQUENCE {
-            info!("Heart rate TX {}: {}", label, hex::encode(packet));
-            if let Err(e) = send_with_retry(&socket, packet).await {
+        let reader = tokio::spawn(heart_rate_recv_thread(
+            self.clone(),
+            socket.clone(),
+            id,
+            ack_tx,
+        ));
+        match start_heart_rate_stream(&socket, &mut ack_rx).await {
+            Ok(()) => Ok(HeartRateSession { id, socket, reader }),
+            Err(e) => {
                 reader.abort();
-                return Err(e.into());
-            }
-            if !delay.is_zero() {
-                sleep(delay).await;
+                Err(e)
             }
         }
-        Ok(HeartRateSession { id, socket, reader })
     }
 
     async fn stop_heart_rate_monitoring_inner(&self) -> Result<()> {
@@ -1401,7 +1403,59 @@ async fn send_with_retry(sp: &SeqPacket, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn heart_rate_recv_thread(manager: AACPManager, sp: Arc<SeqPacket>, id: u64) {
+/// Sends the start sequence, then the start requests in order until one is not rejected.
+async fn start_heart_rate_stream(
+    sp: &SeqPacket,
+    ack_rx: &mut mpsc::UnboundedReceiver<heart_rate::StartAck>,
+) -> Result<()> {
+    for (packet, delay, label) in heart_rate::START_SEQUENCE {
+        info!("Heart rate TX {}: {}", label, hex::encode(packet));
+        send_with_retry(sp, packet).await?;
+        sleep(delay).await;
+    }
+    let mut rejection = None;
+    for (packet, label) in heart_rate::START_CANDIDATES {
+        while ack_rx.try_recv().is_ok() {}
+        info!("Heart rate TX {}: {}", label, hex::encode(packet));
+        send_with_retry(sp, packet).await?;
+        let ack = tokio::time::timeout(heart_rate::START_ACK_TIMEOUT, async {
+            while let Some(ack) = ack_rx.recv().await {
+                if ack.is_heart_rate() {
+                    return Some(ack);
+                }
+            }
+            None
+        })
+        .await;
+        match ack {
+            Ok(Some(ack)) if ack.is_error() => {
+                error!("AirPods rejected {}: {}", label, ack);
+                rejection = Some(ack);
+            }
+            Ok(Some(ack)) => {
+                info!("AirPods accepted {}: {}", label, ack);
+                return Ok(());
+            }
+            // The Android implementation never waits for an acknowledgement; keep listening.
+            Ok(None) | Err(_) => {
+                info!("No acknowledgement for {}, listening anyway", label);
+                return Ok(());
+            }
+        }
+    }
+    let ack = rejection.expect("at least one start candidate");
+    Err(Error::from(std::io::Error::other(format!(
+        "AirPods rejected heart rate start ({})",
+        ack
+    ))))
+}
+
+async fn heart_rate_recv_thread(
+    manager: AACPManager,
+    sp: Arc<SeqPacket>,
+    id: u64,
+    ack_tx: mpsc::UnboundedSender<heart_rate::StartAck>,
+) {
     let mut buf = vec![0u8; heart_rate::RECV_BUFFER_SIZE];
     let reason = loop {
         match sp.recv(&mut buf).await {
@@ -1411,6 +1465,10 @@ async fn heart_rate_recv_thread(manager: AACPManager, sp: Arc<SeqPacket>, id: u6
                 let samples = heart_rate::parse_heart_rate_samples(data);
                 if samples.is_empty() {
                     info!("Heart rate RX {} bytes: {}", n, hex::encode(data));
+                }
+                for ack in heart_rate::parse_start_acks(data) {
+                    info!("Heart rate service ack: {}", ack);
+                    let _ = ack_tx.send(ack);
                 }
                 for bpm in samples {
                     info!("Received Heart Rate: {} bpm", bpm);

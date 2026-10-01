@@ -9,6 +9,8 @@
 //!    Capabilities Request service 4 (180/220/180/220 ms apart).
 //! 3. Control command `0x30` (Heart Rate Monitor) = enabled, wait 120 ms.
 //! 4. One RTBuddy `SensorDataWX` `ServiceSetting(HEARTRATE(19), interval = 1 s)`, seq `0x2363`.
+//!    The AirPods acknowledge it with an IOKit status; if it is rejected (seen on AirPods Pro 3
+//!    firmware: `kIOReturnBadArgument`), the 3 s interval used by Apple's Health app is tried.
 //! 5. Listen passively. Valid samples have service `HEARTRATE(19)`, an 18 byte command
 //!    payload, outer log type `3` and status tail `10 00 00`; `payload[1]` is the bpm.
 //! 6. On stop, send the same `ServiceSetting` with interval `0` (seq `0x236D`) and close.
@@ -40,8 +42,25 @@ pub const HR_STOP: [u8; 28] = [
     0x0B, 0x08, 0x13, 0x10, 0x02, 0x1A, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
 ];
 
-/// Packets sent to start streaming, each followed by the given delay.
-pub const START_SEQUENCE: [(&[u8], Duration, &str); 6] = [
+/// Same request with a 3 s interval (`C0 C6 2D 00` = 3_000_000 us, the value Apple's Health app
+/// uses), seq `0x94`. This is the probe's `HR_START_0894`.
+pub const HR_START_3S: [u8; 28] = [
+    0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x08, 0x94, 0x01, 0x42,
+    0x0B, 0x08, 0x13, 0x10, 0x02, 0x1A, 0x05, 0x01, 0xC0, 0xC6, 0x2D, 0x00,
+];
+
+/// Start requests, tried in order. Some firmware rejects the 1 s interval with
+/// `kIOReturnBadArgument`, in which case the 3 s interval is used.
+pub const START_CANDIDATES: [(&[u8], &str); 2] = [
+    (&HR_START_1S, "HEARTRATE(19) start, interval 1s"),
+    (&HR_START_3S, "HEARTRATE(19) start, interval 3s"),
+];
+
+/// How long to wait for the AirPods to acknowledge a start request.
+pub const START_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Packets sent before the start request, each followed by the given delay.
+pub const START_SEQUENCE: [(&[u8], Duration, &str); 5] = [
     (
         &AACP_CONNECT_SERVICE0,
         Duration::from_millis(180),
@@ -66,11 +85,6 @@ pub const START_SEQUENCE: [(&[u8], Duration, &str); 6] = [
         &HRM_ENABLE,
         Duration::from_millis(120),
         "heart rate monitor enable",
-    ),
-    (
-        &HR_START_1S,
-        Duration::ZERO,
-        "HEARTRATE(19) start, interval 1s",
     ),
 ];
 
@@ -275,6 +289,117 @@ pub fn parse_heart_rate_samples(rx: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Acknowledgement of a `ServiceSetting` (`SensorDataWX` field 9: `{ 1: service, 2: status }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartAck {
+    pub service: u64,
+    pub status: Option<u64>,
+}
+
+impl StartAck {
+    pub fn is_heart_rate(&self) -> bool {
+        self.service == SERVICE_HEARTRATE as u64
+    }
+
+    /// The status is an IOKit `IOReturn`; errors have the `0xE000_0000` system bits set,
+    /// e.g. `0xE00002C2` = `kIOReturnBadArgument`.
+    pub fn is_error(&self) -> bool {
+        self.status
+            .is_some_and(|s| s <= u32::MAX as u64 && s >> 28 == 0xE)
+    }
+}
+
+impl std::fmt::Display for StartAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(0xE000_02C2) => write!(
+                f,
+                "service {} kIOReturnBadArgument (0xE00002C2)",
+                self.service
+            ),
+            Some(status) => write!(f, "service {} status {:#X}", self.service, status),
+            None => write!(f, "service {} ok", self.service),
+        }
+    }
+}
+
+fn parse_type_ack(data: &[u8], start: usize, end: usize) -> Option<StartAck> {
+    let mut service = None;
+    let mut status = None;
+    let mut i = start;
+    while i < end {
+        let (key, next) = read_varint(data, i, end)?;
+        i = next;
+        match key & 7 {
+            0 => {
+                let (val, next) = read_varint(data, i, end)?;
+                i = next;
+                match key >> 3 {
+                    1 => service = Some(val),
+                    2 => status = Some(val),
+                    _ => {}
+                }
+            }
+            2 => {
+                let (len, next) = read_varint(data, i, end)?;
+                i = end.min(next.saturating_add(len as usize));
+            }
+            1 => i = end.min(i + 8),
+            5 => i = end.min(i + 4),
+            _ => break,
+        }
+    }
+    Some(StartAck {
+        service: service?,
+        status,
+    })
+}
+
+/// Returns every `ServiceSetting` acknowledgement contained in a received chunk.
+pub fn parse_start_acks(rx: &[u8]) -> Vec<StartAck> {
+    let mut acks = Vec::new();
+    for frame in extract_aacp_frames(rx) {
+        if le16(frame, 0) != 0x0004
+            || le16(frame, 2) != 0x0004
+            || le16(frame, 4) != RTBUDDY_OPCODE as i32
+            || le32(frame, 6) != DESCRIPTOR_SENSOR_DATA_WX
+        {
+            continue;
+        }
+        let start = 12;
+        let end = frame.len().min(start + le16(frame, 10).max(0) as usize);
+        let mut i = start;
+        while i < end {
+            let Some((key, next)) = read_varint(frame, i, end) else {
+                break;
+            };
+            i = next;
+            match key & 7 {
+                0 => match read_varint(frame, i, end) {
+                    Some((_, next)) => i = next,
+                    None => break,
+                },
+                2 => {
+                    let Some((len, next)) = read_varint(frame, i, end) else {
+                        break;
+                    };
+                    let sub_end = end.min(next.saturating_add(len as usize));
+                    if key >> 3 == 9
+                        && let Some(ack) = parse_type_ack(frame, next, sub_end)
+                    {
+                        acks.push(ack);
+                    }
+                    i = sub_end;
+                }
+                1 => i = end.min(i + 8),
+                5 => i = end.min(i + 4),
+                _ => break,
+            }
+        }
+    }
+    acks
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartRateSample {
     pub bpm: u8,
@@ -399,11 +524,40 @@ mod tests {
             )
         );
         assert_eq!(
+            HR_START_3S.to_vec(),
+            hex(
+                "04 00 04 00 17 00 00 00 10 00 10 00 08 94 01 42 0B 08 13 10 02 1A 05 01 C0 C6 2D 00"
+            )
+        );
+        assert_eq!(
             HR_STOP.to_vec(),
             hex(
                 "04 00 04 00 17 00 00 00 10 00 10 00 08 ED 46 42 0B 08 13 10 02 1A 05 01 00 00 00 00"
             )
         );
+    }
+
+    #[test]
+    fn parses_rejected_start_ack() {
+        // Captured from AirPods Pro 3 in reply to HR_START_1S.
+        let rx = hex("040004001700000010000e00080510014a08081310c28580800e");
+        let acks = parse_start_acks(&rx);
+        assert_eq!(
+            acks,
+            vec![StartAck {
+                service: 19,
+                status: Some(0xE000_02C2)
+            }]
+        );
+        assert!(acks[0].is_heart_rate());
+        assert!(acks[0].is_error());
+        assert!(parse_heart_rate_samples(&rx).is_empty());
+        let ok = StartAck {
+            service: 19,
+            status: None,
+        };
+        assert!(!ok.is_error());
+        assert!(parse_start_acks(&hr_frame(3, 72, [0x10, 0x00, 0x00])).is_empty());
     }
 
     #[test]
