@@ -368,6 +368,9 @@ pub struct AACPManager {
     tasks: Arc<Mutex<JoinSet<()>>>,
     heart_rate_session: Arc<Mutex<Option<HeartRateSession>>>,
     heart_rate_session_id: Arc<AtomicU64>,
+    /// Runtime the manager was created on. The heart rate channel and its reader must live on
+    /// it: the UI calls in from short-lived runtimes that are torn down right after the call.
+    runtime: tokio::runtime::Handle,
 }
 
 /// Dedicated L2CAP channel used for heart rate streaming, see `heart_rate.rs`.
@@ -384,6 +387,7 @@ impl AACPManager {
             tasks: Arc::new(Mutex::new(JoinSet::new())),
             heart_rate_session: Arc::new(Mutex::new(None)),
             heart_rate_session_id: Arc::new(AtomicU64::new(0)),
+            runtime: tokio::runtime::Handle::current(),
         }
     }
 
@@ -1220,9 +1224,31 @@ impl AACPManager {
         }
     }
 
+    /// Runs `f` on the manager's runtime and waits for it, from any runtime.
+    async fn run_on_manager_runtime<F, Fut>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(AACPManager) -> Fut,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.runtime.spawn(f(self.clone())).await.map_err(|e| {
+            Error::from(std::io::Error::other(format!("heart rate task failed: {}", e)))
+        })?
+    }
+
     /// Opens a dedicated AACP channel and starts heart rate streaming, replicating the working
     /// Android implementation (see `heart_rate.rs`).
     pub async fn start_heart_rate_monitoring(&self) -> Result<()> {
+        self.run_on_manager_runtime(|m| async move { m.start_heart_rate_monitoring_inner().await })
+            .await
+    }
+
+    /// Stops heart rate streaming and closes the dedicated channel. Statistics are kept.
+    pub async fn stop_heart_rate_monitoring(&self) -> Result<()> {
+        self.run_on_manager_runtime(|m| async move { m.stop_heart_rate_monitoring_inner().await })
+            .await
+    }
+
+    async fn start_heart_rate_monitoring_inner(&self) -> Result<()> {
         let mut session = self.heart_rate_session.lock().await;
         if session.is_some() {
             return Ok(());
@@ -1277,8 +1303,7 @@ impl AACPManager {
         Ok(HeartRateSession { id, socket, reader })
     }
 
-    /// Stops heart rate streaming and closes the dedicated channel. Statistics are kept.
-    pub async fn stop_heart_rate_monitoring(&self) -> Result<()> {
+    async fn stop_heart_rate_monitoring_inner(&self) -> Result<()> {
         let session = self.heart_rate_session.lock().await.take();
         let result = match session {
             Some(session) => {
@@ -1383,8 +1408,11 @@ async fn heart_rate_recv_thread(manager: AACPManager, sp: Arc<SeqPacket>, id: u6
             Ok(0) => break "Heart rate channel closed by AirPods".to_string(),
             Ok(n) => {
                 let data = &buf[..n];
-                debug!("Heart rate RX {} bytes: {}", n, hex::encode(data));
-                for bpm in heart_rate::parse_heart_rate_samples(data) {
+                let samples = heart_rate::parse_heart_rate_samples(data);
+                if samples.is_empty() {
+                    info!("Heart rate RX {} bytes: {}", n, hex::encode(data));
+                }
+                for bpm in samples {
                     info!("Received Heart Rate: {} bpm", bpm);
                     manager.update_heart_rate(|hr| hr.add_sample(bpm)).await;
                 }
